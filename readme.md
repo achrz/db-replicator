@@ -7,4 +7,6 @@ Dan ini bisa dinamis baca semua tabel, jadi gak perlu nulis satu satu nama tabel
 
 bisa realtime, tinggal pakein cron job aja, kalau mau sync pakai replica-upsert atau init-sync kalau masih pertama kali. Kalau mau sync yang delete tinggal cron replica-prune
 
+run : clone, npm i, node init-sync.js
+
 udah sih gitu aja palingan
