@@ -25,19 +25,19 @@ async function runPrune() {
         destPool = mysql.createPool(config.dest);
 
         console.log(`🗑️  Connecting to cPanel to fetch table list...`);
-        
-        // 1. AMBIL DAFTAR TABEL DARI CPANEL
-        const [tablesRaw] = await sourcePool.query("SHOW TABLES");
+
+        // HANYA ambil tabel fisik (Base Table), abaikan View
+        const [tablesRaw] = await sourcePool.query("SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'");
         const tablesToSync = tablesRaw.map(row => Object.values(row)[0]);
 
         for (const tableName of tablesToSync) {
             try {
                 // 2. Cari Primary Key (Wajib punya PK buat hapus)
                 const [keys] = await sourcePool.query(`SHOW KEYS FROM ?? WHERE Key_name = 'PRIMARY'`, [tableName]);
-                
+
                 if (keys.length === 0) {
                     // Skip kalau tabel gak punya ID unik
-                    continue; 
+                    continue;
                 }
                 const pk = keys[0].Column_name;
 
@@ -47,7 +47,7 @@ async function runPrune() {
 
                 // 4. Ambil SEMUA ID dari Server Fisik (Dest)
                 const [destIds] = await destPool.query(`SELECT ?? FROM ??`, [pk, tableName]);
-                
+
                 // 5. Bandingkan: Mana ID di Server Fisik yg GAK ADA di cPanel?
                 const idsToDelete = [];
                 for (const row of destIds) {

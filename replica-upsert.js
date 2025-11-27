@@ -28,8 +28,8 @@ async function runUpsert() {
 
         console.log(`🚀 Connecting to cPanel to fetch table list...`);
 
-        // 1. AMBIL DAFTAR TABEL OTOMATIS DARI CPANEL
-        const [tablesRaw] = await sourcePool.query("SHOW TABLES");
+        // HANYA ambil tabel fisik (Base Table), abaikan View
+        const [tablesRaw] = await sourcePool.query("SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'");
 
         // Ubah hasil query jadi array string nama tabel
         // Object.values(row)[0] mengambil value pertama (nama tabel) tanpa peduli key-nya
@@ -77,12 +77,12 @@ async function runUpsert() {
                 let params = [];
 
                 if (hasUpdatedAt) {
-                    query = `SELECT * FROM ?? WHERE updated_at >= ? LIMIT 3000`;
+                    query = `SELECT * FROM ?? WHERE updated_at >= ? LIMIT 10000`;
                     params = [tableName, lastSync];
                 } else {
                     // Fallback kalau gak ada updated_at (Optional: skip atau ambil semua)
-                    // Disini saya limit 3000 aja biar aman
-                    query = `SELECT * FROM ?? LIMIT 3000`;
+                    // Disini saya limit 10000 aja biar aman
+                    query = `SELECT * FROM ?? LIMIT 10000`;
                     params = [tableName];
                 }
 
@@ -94,9 +94,12 @@ async function runUpsert() {
                     const placeholders = changes.map(() => `(${columns.map(() => '?').join(', ')})`).join(', ');
                     const flatValues = values.flat();
 
-                    const updateOnDuplicate = columns.map(f => `${f} = VALUES(${f})`).join(', ');
-                    const sql = `INSERT INTO ?? (${columns.join(', ')}) VALUES ${placeholders} 
-                                 ON DUPLICATE KEY UPDATE ${updateOnDuplicate}`;
+                    const escapedColumns = columns.map(col => `\`${col}\``).join(', ');
+
+                    const updateOnDuplicate = columns.map(f => `\`${f}\` = VALUES(\`${f}\`)`).join(', ');
+
+                    const sql = `INSERT INTO ?? (${escapedColumns}) VALUES ${placeholders} 
+                             ON DUPLICATE KEY UPDATE ${updateOnDuplicate}`;
 
                     await destPool.query(sql, [tableName, ...flatValues]);
                     console.log(`[${tableName}] ⚡ Synced ${changes.length} rows.`);
