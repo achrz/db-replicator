@@ -4,17 +4,19 @@ const mysql = require('mysql2/promise');
 const config = {
     source: {
         host: process.env.SOURCE_DB_HOST,
+        port: process.env.SOURCE_DB_PORT || 3306,
         user: process.env.SOURCE_DB_USER,
         password: process.env.SOURCE_DB_PASSWORD,
         database: process.env.SOURCE_DB_NAME,
-        connectTimeout: 60000 
+        connectTimeout: 60000
     },
     dest: {
         host: process.env.DEST_DB_HOST,
+        port: process.env.DEST_DB_PORT,
         user: process.env.DEST_DB_USER,
         password: process.env.DEST_DB_PASSWORD,
         database: process.env.DEST_DB_NAME,
-        multipleStatements: true 
+        multipleStatements: true
     }
 };
 
@@ -32,53 +34,66 @@ async function runInitialSync() {
 
         const [tablesRaw] = await sourcePool.query("SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'");
         const tablesToSync = tablesRaw.map(row => Object.values(row)[0]);
-        
+
         await destPool.query('SET FOREIGN_KEY_CHECKS=0');
 
         for (const tableName of tablesToSync) {
             console.log(`\n🔄 Memproses Tabel: [ ${tableName} ]`);
-            
+
             // 1. Cek & Create Tabel
             const [checkTable] = await destPool.query(`SHOW TABLES LIKE ?`, [tableName]);
-            
+
             if (checkTable.length === 0) {
                 console.log(`   🏗️  Membuat Tabel Baru (Convert ke InnoDB)...`);
                 const [createSyntax] = await sourcePool.query(`SHOW CREATE TABLE ??`, [tableName]);
                 let sqlCreate = createSyntax[0]['Create Table'];
 
-                // --- BAGIAN PERBAIKAN (REGEX LEBIH AGRESIF) ---
-                
-                // 1. Hapus nama database SOURCE secara spesifik (paling aman)
-                const dbName = process.env.SOURCE_DB_NAME;
-                // Hapus `nama_db`.
-                sqlCreate = sqlCreate.split(`\`${dbName}\`.`).join('');
-                // Hapus nama_db. (tanpa backtick)
-                sqlCreate = sqlCreate.split(`${dbName}.`).join('');
-                
-                // 2. Hapus sisa-sisa prefix db lain (generic)
-                sqlCreate = sqlCreate.replace(/`[^`]+`\./g, ''); 
+                // --- BAGIAN PERBAIKAN (REGEX LEBIH AGRESIF & ANTI OBESITAS) ---
 
-                // 3. Paksa ganti ENGINE ke InnoDB
+                // 1. Bersihkan nama DB & Prefix
+                const dbName = process.env.SOURCE_DB_NAME;
+                sqlCreate = sqlCreate.split(`\`${dbName}\`.`).join('');
+                sqlCreate = sqlCreate.split(`${dbName}.`).join('');
+                sqlCreate = sqlCreate.replace(/`[^`]+`\./g, '');
+
+                // 2. Paksa ganti ENGINE ke InnoDB
                 sqlCreate = sqlCreate.replace(/ENGINE=\w+/gi, 'ENGINE=InnoDB');
-                
-                // 4. Bersihkan Charset Latin1 (Biar gak error Collation)
+
+                // --- UPDATE REGEX ANTI BENTROK ---
+
+                // 1. Basmi Collation Aneh-aneh (uca1400, 0900, swedish, dll)
+                sqlCreate = sqlCreate.replace(/utf8mb4_uca1400_ai_ci/gi, 'utf8mb4_unicode_ci');
+                sqlCreate = sqlCreate.replace(/utf8mb4_0900_ai_ci/gi, 'utf8mb4_unicode_ci');
                 sqlCreate = sqlCreate.replace(/latin1_swedish_ci/gi, 'utf8mb4_unicode_ci');
+
+                // 2. Pastikan Charset-nya utf8mb4
                 sqlCreate = sqlCreate.replace(/latin1/gi, 'utf8mb4');
                 sqlCreate = sqlCreate.replace(/DEFAULT CHARSET=\w+/gi, 'DEFAULT CHARSET=utf8mb4');
                 sqlCreate = sqlCreate.replace(/COLLATE=\w+/gi, 'COLLATE=utf8mb4_unicode_ci');
+
+                // 3. HAPUS ROW_FORMAT LAMA (Biar gak bentrok)
                 sqlCreate = sqlCreate.replace(/ROW_FORMAT=\w+/gi, '');
+
+                // 4. TAMBAHKAN ROW_FORMAT=DYNAMIC (SOLUSI OBESITAS)
+                // Kita tempelkan ini di akhir string CREATE TABLE, sebelum tutup kurung engine
+                // Cara gampangnya: Replace "ENGINE=InnoDB" jadi "ENGINE=InnoDB ROW_FORMAT=DYNAMIC"
+                sqlCreate = sqlCreate.replace('ENGINE=InnoDB', 'ENGINE=InnoDB ROW_FORMAT=DYNAMIC');
 
                 // -----------------------------------------------
 
                 // EKSEKUSI DENGAN DEBUGGER
                 try {
+                    // --- JURUS SUHU: MATIKAN STRICT MODE SEMENTARA ---
+                    // Biar InnoDB gak rewel soal row size, dia bakal handle overflow otomatis
+                    await destPool.query(`SET SESSION innodb_strict_mode=0`);
+
                     await destPool.query(sqlCreate);
-                    console.log(`   ✅ Tabel dibuat dengan engine InnoDB.`);
-                    
+                    console.log(`   ✅ Tabel dibuat (InnoDB + Dynamic Row).`);
+
                     // Tambah Index Updated_at
                     try {
                         await destPool.query(`CREATE INDEX idx_updated_at ON \`${tableName}\` (updated_at)`);
-                    } catch (e) {}
+                    } catch (e) { }
 
                 } catch (createErr) {
                     console.error(`   ❌ GAGAL MEMBUAT TABEL!`);
@@ -105,11 +120,11 @@ async function runInitialSync() {
 
             while (!isFinished) {
                 const [rows] = await destPool.query(
-                    `SELECT updated_at, ?? as last_id FROM ?? ORDER BY updated_at DESC, ?? DESC LIMIT 1`, 
+                    `SELECT updated_at, ?? as last_id FROM ?? ORDER BY updated_at DESC, ?? DESC LIMIT 1`,
                     [pk, tableName, pk]
                 );
 
-                let lastSync = new Date(0); 
+                let lastSync = new Date(0);
                 let lastId = 0;
                 if (rows.length > 0 && rows[0].updated_at) {
                     lastSync = rows[0].updated_at;
@@ -133,7 +148,7 @@ async function runInitialSync() {
 
                     const sql = `INSERT INTO ?? (${escapedColumns}) VALUES ${placeholders} ON DUPLICATE KEY UPDATE ${updateOnDuplicate}`;
                     await destPool.query(sql, [tableName, ...flatValues]);
-                    
+
                     totalSyncedForTable += changes.length;
                     process.stdout.write(`\r   ⚡ Progress: ${totalSyncedForTable} baris...`);
                     await sleep(200);

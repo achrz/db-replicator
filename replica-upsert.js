@@ -4,6 +4,7 @@ const mysql = require('mysql2/promise');
 const config = {
     source: {
         host: process.env.SOURCE_DB_HOST,
+        port: process.env.SOURCE_DB_PORT || 3306,
         user: process.env.SOURCE_DB_USER,
         password: process.env.SOURCE_DB_PASSWORD,
         database: process.env.SOURCE_DB_NAME,
@@ -11,6 +12,7 @@ const config = {
     },
     dest: {
         host: process.env.DEST_DB_HOST,
+        port: process.env.DEST_DB_PORT,
         user: process.env.DEST_DB_USER,
         password: process.env.DEST_DB_PASSWORD,
         database: process.env.DEST_DB_NAME,
@@ -19,74 +21,105 @@ const config = {
 };
 
 async function runUpsert() {
-    console.time('Total Waktu Sync');
+    // console.time('Total Waktu Sync'); // Optional: matikan timer biar log cron bersih
     let sourcePool, destPool;
 
     try {
         sourcePool = mysql.createPool(config.source);
         destPool = mysql.createPool(config.dest);
 
-        console.log(`🚀 Connecting to cPanel to fetch table list...`);
-
-        // HANYA ambil tabel fisik (Base Table), abaikan View
+        // HANYA ambil tabel fisik (Base Table)
         const [tablesRaw] = await sourcePool.query("SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'");
-
-        // Ubah hasil query jadi array string nama tabel
-        // Object.values(row)[0] mengambil value pertama (nama tabel) tanpa peduli key-nya
         const tablesToSync = tablesRaw.map(row => Object.values(row)[0]);
 
-        console.log(`📋 Ditemukan ${tablesToSync.length} tabel: [ ${tablesToSync.join(', ')} ]`);
-
-        // Matikan FK check biar aman
+        // Matikan FK check & Strict Mode (PENTING BUAT TABEL GEMOY)
         await destPool.query('SET FOREIGN_KEY_CHECKS=0');
+        await destPool.query(`SET SESSION innodb_strict_mode=0`);
 
         for (const tableName of tablesToSync) {
             try {
-                // A. Cek/Create Tabel (Skip kalau kamu udah import manual, ini jaga-jaga aja)
+                // ======================================================
+                // 1. CEK & CREATE TABEL (LOGIC ANTI-OBESITAS & AUTO INNODB)
+                // ======================================================
                 const [checkTable] = await destPool.query(`SHOW TABLES LIKE ?`, [tableName]);
 
                 if (checkTable.length === 0) {
-                    console.log(`[${tableName}] Tabel belum ada di server fisik. Mencoba copy structure...`);
+                    // console.log(`[${tableName}] Tabel baru terdeteksi. Membuat struktur...`);
                     const [createSyntax] = await sourcePool.query(`SHOW CREATE TABLE ??`, [tableName]);
                     let sqlCreate = createSyntax[0]['Create Table'];
-                    sqlCreate = sqlCreate.replace(/`[^`]+`\./g, ''); // Hapus nama DB cPanel
+
+                    // --- BERSIH-BERSIH SQL (Sama kayak init-sync) ---
+                    const dbName = process.env.SOURCE_DB_NAME;
+                    sqlCreate = sqlCreate.split(`\`${dbName}\`.`).join('');
+                    sqlCreate = sqlCreate.split(`${dbName}.`).join('');
+                    sqlCreate = sqlCreate.replace(/`[^`]+`\./g, ''); 
+
+                    // Paksa InnoDB & Dynamic Row
+                    sqlCreate = sqlCreate.replace(/ENGINE=\w+/gi, 'ENGINE=InnoDB');
+                    sqlCreate = sqlCreate.replace(/ROW_FORMAT=\w+/gi, '');
+                    sqlCreate = sqlCreate.replace('ENGINE=InnoDB', 'ENGINE=InnoDB ROW_FORMAT=DYNAMIC');
+
+                    // Bersihkan Charset
+                    sqlCreate = sqlCreate.replace(/utf8mb4_uca1400_ai_ci/gi, 'utf8mb4_unicode_ci');
+                    sqlCreate = sqlCreate.replace(/latin1_swedish_ci/gi, 'utf8mb4_unicode_ci');
+                    sqlCreate = sqlCreate.replace(/latin1/gi, 'utf8mb4');
+                    sqlCreate = sqlCreate.replace(/DEFAULT CHARSET=\w+/gi, 'DEFAULT CHARSET=utf8mb4');
+                    sqlCreate = sqlCreate.replace(/COLLATE=\w+/gi, 'COLLATE=utf8mb4_unicode_ci');
+
                     await destPool.query(sqlCreate);
+                    
+                    // Paksa Index Updated_at
+                    try { await destPool.query(`CREATE INDEX idx_updated_at ON \`${tableName}\` (updated_at)`); } catch (e) {}
                 }
 
-                // B. Cek Last Sync (Logic Updated_at)
-                // Pastikan tabel punya kolom updated_at, kalau gak punya, kita skip logikanya
-                let lastSync = new Date(0); // Default 1970
-                let hasUpdatedAt = false;
-
-                // Cek kolom dulu
+                // ======================================================
+                // 2. LOGIC SMART CURSOR (TIE-BREAKER)
+                // ======================================================
+                
+                // Cek PK & Updated_at
+                const [keys] = await sourcePool.query(`SHOW KEYS FROM ?? WHERE Key_name = 'PRIMARY'`, [tableName]);
                 const [cols] = await destPool.query(`SHOW COLUMNS FROM ?? LIKE 'updated_at'`, [tableName]);
-                if (cols.length > 0) {
-                    hasUpdatedAt = true;
-                    const [rows] = await destPool.query(`SELECT MAX(updated_at) as last_sync FROM ??`, [tableName]);
-                    if (rows[0].last_sync) {
-                        lastSync = new Date(new Date(rows[0].last_sync).getTime() - 60000);
-                    }
-                } else {
-                    // Kalau gak ada updated_at, kita asumsikan selalu sync data baru (berdasarkan PK) 
-                    // atau skip dulu biar gak error. Disini saya set warning aja.
-                    console.log(`[${tableName}] ⚠️  Warning: Tidak ada kolom 'updated_at'. Full scan mungkin berat.`);
+
+                // Kalau gak punya syarat (PK/Updated_at), skip atau fallback ke mode bodoh
+                if (keys.length === 0 || cols.length === 0) {
+                     // Fallback: Ambil 100 data teratas (Risiko: Data baru yg masuk dibawah gak keambil)
+                     // console.log(`[${tableName}] Skip Smart Logic (No PK/Updated_at)`);
+                     continue; 
                 }
 
-                // C. Tarik Data
-                let query = '';
-                let params = [];
+                const pk = keys[0].Column_name;
 
-                if (hasUpdatedAt) {
-                    query = `SELECT * FROM ?? WHERE updated_at >= ? LIMIT 10000`;
-                    params = [tableName, lastSync];
-                } else {
-                    // Fallback kalau gak ada updated_at (Optional: skip atau ambil semua)
-                    // Disini saya limit 10000 aja biar aman
-                    query = `SELECT * FROM ?? LIMIT 10000`;
-                    params = [tableName];
+                // Ambil Posisi Terakhir di Server Fisik
+                const [rows] = await destPool.query(
+                    `SELECT updated_at, ?? as last_id FROM ?? ORDER BY updated_at DESC, ?? DESC LIMIT 1`, 
+                    [pk, tableName, pk]
+                );
+
+                let lastSync = new Date(0); 
+                let lastId = 0;
+
+                if (rows.length > 0 && rows[0].updated_at) {
+                    lastSync = rows[0].updated_at;
+                    lastId = rows[0].last_id;
                 }
 
-                const [changes] = await sourcePool.query(query, params);
+                // ======================================================
+                // 3. TARIK DATA (LIMIT 3000 CUKUP UNTUK CRON 1 MENIT)
+                // ======================================================
+                // Limit 10.000 terlalu besar untuk cron 1 menit, risiko timeout. 
+                // 3.000 lebih aman. Karena script ini jalan tiap menit, dia bakal kejar tayang kok.
+                
+                const query = `
+                    SELECT * FROM ?? 
+                    WHERE (updated_at > ?) 
+                       OR (updated_at = ? AND ?? > ?) 
+                    ORDER BY updated_at ASC, ?? ASC 
+                    LIMIT 3000
+                `;
+
+                const [changes] = await sourcePool.query(query, [
+                    tableName, lastSync, lastSync, pk, lastId, pk
+                ]);
 
                 if (changes.length > 0) {
                     const columns = Object.keys(changes[0]);
@@ -95,17 +128,15 @@ async function runUpsert() {
                     const flatValues = values.flat();
 
                     const escapedColumns = columns.map(col => `\`${col}\``).join(', ');
-
                     const updateOnDuplicate = columns.map(f => `\`${f}\` = VALUES(\`${f}\`)`).join(', ');
 
                     const sql = `INSERT INTO ?? (${escapedColumns}) VALUES ${placeholders} 
-                             ON DUPLICATE KEY UPDATE ${updateOnDuplicate}`;
+                                 ON DUPLICATE KEY UPDATE ${updateOnDuplicate}`;
 
                     await destPool.query(sql, [tableName, ...flatValues]);
                     console.log(`[${tableName}] ⚡ Synced ${changes.length} rows.`);
-                } else {
-                    console.log(`[${tableName}] 👌 Up-to-date.`);
-                }
+                } 
+                // else { console.log(`[${tableName}] 👌 Up-to-date.`); } // Silent aja biar log cron gak penuh
 
             } catch (loopErr) {
                 console.error(`[${tableName}] ❌ Error: ${loopErr.message}`);
@@ -117,7 +148,7 @@ async function runUpsert() {
     } finally {
         if (sourcePool) await sourcePool.end();
         if (destPool) await destPool.end();
-        console.timeEnd('Total Waktu Sync');
+        // console.timeEnd('Total Waktu Sync');
     }
 }
 
