@@ -9,7 +9,8 @@ const config = {
         password: process.env.SOURCE_DB_PASSWORD,
         database: process.env.SOURCE_DB_NAME,
         supportBigNumbers: true, // PENTING: Biar ID besar gak error
-        bigNumberStrings: true   // PENTING: Biar ID besar jadi string
+        bigNumberStrings: true,   // PENTING: Biar ID besar jadi string
+        compress: true
     },
     dest: {
         host: process.env.DEST_DB_HOST,
