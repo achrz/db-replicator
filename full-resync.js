@@ -12,7 +12,7 @@ const mysql = require('mysql2/promise');
 // Jika diisi 'C', maka A dan B di-skip. C, D, E diproses.
 // Kosongkan '' jika ingin memproses dari awal.
 
-const START_FROM_TABLE = 'tb_transfer_egg_backup';
+const START_FROM_TABLE = '';
 
 // ==========================================
 

@@ -9,6 +9,7 @@ const config = {
         password: process.env.SOURCE_DB_PASSWORD,
         database: process.env.SOURCE_DB_NAME,
         connectTimeout: 60000,
+        dateStrings: true,
         compress: true
     },
     dest: {
@@ -17,7 +18,8 @@ const config = {
         user: process.env.DEST_DB_USER,
         password: process.env.DEST_DB_PASSWORD,
         database: process.env.DEST_DB_NAME,
-        multipleStatements: true
+        multipleStatements: true,
+        dateStrings: true
     }
 };
 
